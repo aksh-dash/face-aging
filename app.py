@@ -98,7 +98,7 @@ def load_model():
 
 model = load_model()
 
-camera_image = st.camera_input("", label_visibility="collapsed")
+camera_image = st.file_uploader("Upload a photo", type=["jpg", "jpeg", "png"])
 
 if camera_image is not None:
     img = Image.open(camera_image)
