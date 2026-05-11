@@ -47,7 +47,10 @@ class FaceAgingModel:
         age = self.AGE_BUCKETS[preds[0].argmax()]
         return age
 
-    def predict(self, img_bgr):
+    def predict(self, img):
+        if img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         faces_data = self.detect_faces(img_bgr)
         results = []
         output_img = img_bgr.copy()
@@ -58,10 +61,10 @@ class FaceAgingModel:
             cv2.rectangle(output_img, (startX, startY), (endX, endY), (74, 158, 255), 2)
             cv2.putText(output_img, age, (startX, startY - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (74, 158, 255), 2)
-        return output_img, results
+        output_rgb = cv2.cvtColor(output_img, cv2.COLOR_BGR2RGB)
+        return output_rgb, results
 
 
-# ---- UI ----
 st.set_page_config(page_title="Face Analysis System", layout="centered")
 
 st.markdown("""
@@ -81,6 +84,7 @@ st.markdown("""
 .result-conf { color: #555555; font-size: 0.8rem; margin-top: 4px; }
 .no-face { color: #555555; font-style: italic; }
 .footer-text { color: #333333; font-size: 0.75rem; text-align: center; margin-top: 4rem; }
+[data-testid="stCameraInput"] video { border-radius: 8px !important; border: 1px solid #2a2a2a !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -94,49 +98,32 @@ def load_model():
 
 model = load_model()
 
-# OpenCV webcam — browser permission nahi chahiye
-run = st.checkbox("Start Camera", value=False)
-frame_placeholder = st.empty()
-result_placeholder = st.empty()
+camera_image = st.camera_input("", label_visibility="collapsed")
 
-cap = None
-
-if run:
-    cap = cv2.VideoCapture(0)
-    while run:
-        ret, frame = cap.read()
-        if not ret:
-            st.error("Camera nahi mili — check karo")
-            break
-
-        processed, results = model.predict(frame)
-        frame_rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
-        frame_placeholder.image(frame_rgb, channels="RGB", use_column_width=True)
-
-        if results:
-            res = results[0]
-            result_placeholder.markdown(f"""
-                <div class="result-card">
-                    <div class="result-label">Detected Age</div>
-                    <div class="result-value">{res['age']}</div>
-                    <div class="result-conf">Confidence: {res['confidence']:.2f}</div>
-                </div>
-            """, unsafe_allow_html=True)
-        else:
-            result_placeholder.markdown("""
-                <div class="result-card">
-                    <div class="no-face">No face detected</div>
-                </div>
-            """, unsafe_allow_html=True)
-
-        run = st.session_state.get("Start Camera", True)
-
-    if cap:
-        cap.release()
+if camera_image is not None:
+    img = Image.open(camera_image)
+    img_np = np.array(img)
+    processed_img, results = model.predict(img_np)
+    st.image(processed_img, use_column_width=True)
+    if results:
+        res = results[0]
+        st.markdown(f"""
+            <div class="result-card">
+                <div class="result-label">Detected Age</div>
+                <div class="result-value">{res['age']}</div>
+                <div class="result-conf">Confidence: {res['confidence']:.2f}</div>
+            </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+            <div class="result-card">
+                <div class="no-face">No face detected</div>
+            </div>
+        """, unsafe_allow_html=True)
 else:
-    result_placeholder.markdown("""
+    st.markdown("""
         <div class="result-card">
-            <div class="no-face">Check "Start Camera" to begin</div>
+            <div class="no-face">Awaiting camera capture...</div>
         </div>
     """, unsafe_allow_html=True)
 
