@@ -1,130 +1,212 @@
+import time
+
 import streamlit as st
 import cv2
 import numpy as np
-import os
 from PIL import Image
+import av
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode, RTCConfiguration
 
-class FaceAgingModel:
-    def __init__(self):
-        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-        self.face_net = cv2.dnn.readNetFromCaffe(
-            os.path.join(BASE_DIR, "models", "deploy.prototxt"),
-            os.path.join(BASE_DIR, "models", "res10_300x300_ssd_iter_140000.caffemodel")
-        )
-        self.age_net = cv2.dnn.readNetFromCaffe(
-            os.path.join(BASE_DIR, "models", "age_deploy.prototxt"),
-            os.path.join(BASE_DIR, "models", "age_net.caffemodel")
-        )
-        self.AGE_BUCKETS = [
-            "(0-2)", "(4-6)", "(8-12)", "(15-20)", "(20-25)",
-            "(25-32)", "(38-43)", "(48-53)", "(60-100)"
-        ]
-
-    def detect_faces(self, img):
-        (h, w) = img.shape[:2]
-        blob = cv2.dnn.blobFromImage(img, 1.0, (300, 300), (104.0, 177.0, 123.0))
-        self.face_net.setInput(blob)
-        detections = self.face_net.forward()
-        faces = []
-        for i in range(detections.shape[2]):
-            confidence = detections[0, 0, i, 2]
-            if confidence > 0.5:
-                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                (startX, startY, endX, endY) = box.astype("int")
-                startX, startY = max(0, startX), max(0, startY)
-                endX, endY = min(w, endX), min(h, endY)
-                faces.append(((startX, startY, endX, endY), confidence))
-        return faces
-
-    def predict_age(self, img, face_box):
-        (startX, startY, endX, endY) = face_box
-        face = img[startY:endY, startX:endX]
-        if face.size == 0:
-            return "Unknown"
-        face_blob = cv2.dnn.blobFromImage(face, 1.0, (227, 227), (78.426, 87.768, 114.895))
-        self.age_net.setInput(face_blob)
-        preds = self.age_net.forward()
-        age = self.AGE_BUCKETS[preds[0].argmax()]
-        return age
-
-    def predict(self, img):
-        if img.shape[2] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        faces_data = self.detect_faces(img_bgr)
-        results = []
-        output_img = img_bgr.copy()
-        for (face_box, confidence) in faces_data:
-            age = self.predict_age(img_bgr, face_box)
-            results.append({"age": age, "confidence": confidence})
-            (startX, startY, endX, endY) = face_box
-            cv2.rectangle(output_img, (startX, startY), (endX, endY), (74, 158, 255), 2)
-            cv2.putText(output_img, age, (startX, startY - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (74, 158, 255), 2)
-        output_rgb = cv2.cvtColor(output_img, cv2.COLOR_BGR2RGB)
-        return output_rgb, results
-
+from model import FaceAnalyzer
+from tracker import FaceTracker
+from overlay import draw_overlay, build_stats, tag_primary
+from theme import PALETTE, FONTS, SIZES
 
 st.set_page_config(page_title="Face Analysis System", layout="centered")
 
-st.markdown("""
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+# Theme variables injected once; the static CSS below references them via var().
+st.markdown(f"""
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-.stApp { background-color: #111111; color: #ffffff; }
-.block-container { max-width: 800px !important; padding-top: 3rem !important; }
-* { font-family: 'Inter', sans-serif !important; }
-#MainMenu, header, footer { visibility: hidden; }
-.title { color: #ffffff; font-size: 2.2rem; font-weight: 700; text-align: center; }
-.subtitle { color: #888888; font-size: 0.9rem; text-align: center; margin-bottom: 1.5rem; }
-.divider { height: 1px; background-color: #2a2a2a; margin-bottom: 2rem; }
-.result-card { background-color: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;
-               padding: 24px; margin-top: 1.5rem; text-align: center; }
-.result-label { color: #888888; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05rem; }
-.result-value { color: #4A9EFF; font-size: 2.5rem; font-weight: 700; }
-.result-conf { color: #555555; font-size: 0.8rem; margin-top: 4px; }
-.no-face { color: #555555; font-style: italic; }
-.footer-text { color: #333333; font-size: 0.75rem; text-align: center; margin-top: 4rem; }
-[data-testid="stCameraInput"] video { border-radius: 8px !important; border: 1px solid #2a2a2a !important; }
+:root {{
+  --bg:{PALETTE['bg']}; --text:{PALETTE['text']}; --muted:{PALETTE['muted']};
+  --faint:{PALETTE['faint']}; --divider:{PALETTE['divider']};
+  --ui:{FONTS['ui']}; --mono:{FONTS['mono']}; --maxw:{SIZES['max_width']}px;
+}}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="title">Face Analysis System</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Real-time age detection using deep learning</div>', unsafe_allow_html=True)
-st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+st.markdown("""
+<style>
+.stApp { background:var(--bg); color:var(--text); }
+html, body, [class*="css"], .stMarkdown, .stButton, .stCaption { font-family:var(--ui); }
+.block-container { max-width:var(--maxw) !important; padding-top:2.2rem !important; padding-bottom:3rem !important; }
+#MainMenu, header, footer { visibility:hidden; }
+.klabel { color:var(--muted); font-size:0.66rem; letter-spacing:0.30em; text-transform:uppercase;
+          text-align:center; margin:0 0 1.6rem 0; }
+/* mode switch — borderless uppercase text, no boxes/fills */
+.stButton > button { background:transparent !important; border:none !important; border-radius:0 !important;
+  box-shadow:none !important; color:var(--muted) !important; font-size:0.8rem !important;
+  letter-spacing:0.18em !important; text-transform:uppercase; padding:0.15rem 0 0.4rem 0 !important; }
+.stButton > button:hover, .stButton > button:focus { color:var(--text) !important; box-shadow:none !important; }
+/* the image/video is the hero */
+div[data-testid="stImage"] { display:flex; justify-content:center; }
+[data-testid="stImage"] img { border:1px solid var(--divider); }
+/* download button — minimal text */
+.stDownloadButton > button { background:transparent !important; border:none !important; box-shadow:none !important;
+  color:var(--muted) !important; font-size:0.72rem !important; letter-spacing:0.18em !important; text-transform:uppercase; }
+.stDownloadButton > button:hover { color:var(--text) !important; }
+[data-testid="stCaptionContainer"], .stCaption { color:var(--muted) !important; letter-spacing:0.04em; }
+.disclaimer { color:var(--faint); font-size:0.7rem; letter-spacing:0.05em; text-align:center; margin-top:3rem; }
+</style>
+""", unsafe_allow_html=True)
 
+st.markdown('<p class="klabel">Face Analysis</p>', unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Load model once (cached). Clear error if any model file is missing.
+# ---------------------------------------------------------------------------
 @st.cache_resource
 def load_model():
-    return FaceAgingModel()
+    return FaceAnalyzer()
 
-model = load_model()
+try:
+    model = load_model()
+except FileNotFoundError as e:
+    st.error(str(e))
+    st.info("Place all required model files in the models/ folder and restart.")
+    st.stop()
 
-camera_image = st.file_uploader("Upload a photo", type=["jpg", "jpeg", "png"])
+# ---------------------------------------------------------------------------
+# Mode switch (default LIVE CAMERA). Not rendering the webrtc component in
+# upload mode unmounts it, which stops the camera — satisfying "switching
+# modes must stop the camera and clear old results".
+# ---------------------------------------------------------------------------
+if "mode" not in st.session_state:
+    st.session_state.mode = "LIVE CAMERA"
 
-if camera_image is not None:
-    img = Image.open(camera_image)
-    img_np = np.array(img)
-    processed_img, results = model.predict(img_np)
-    st.image(processed_img, use_column_width=True)
-    if results:
-        res = results[0]
-        st.markdown(f"""
-            <div class="result-card">
-                <div class="result-label">Detected Age</div>
-                <div class="result-value">{res['age']}</div>
-                <div class="result-conf">Confidence: {res['confidence']:.2f}</div>
-            </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown("""
-            <div class="result-card">
-                <div class="no-face">No face detected</div>
-            </div>
-        """, unsafe_allow_html=True)
+col_u, col_l = st.columns(2)
+with col_u:
+    if st.button("UPLOAD PHOTO", key="btn_upload", use_container_width=True):
+        st.session_state.mode = "UPLOAD PHOTO"
+with col_l:
+    if st.button("LIVE CAMERA", key="btn_live", use_container_width=True):
+        st.session_state.mode = "LIVE CAMERA"
+
+# Active option: off-white with a 1px underline; inactive stays muted grey.
+_active = ""
+for _key, _name in (("btn_upload", "UPLOAD PHOTO"), ("btn_live", "LIVE CAMERA")):
+    if st.session_state.mode == _name:
+        _active += (
+            "div.st-key-%s button { color:%s !important; "
+            "border-bottom:1px solid %s !important; }"
+            % (_key, PALETTE["text"], PALETTE["text"])
+        )
+st.markdown("<style>%s</style>" % _active, unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Collapsed settings shared by both modes. Detection threshold applies to both;
+# prediction interval is live-only (it drives the tracker's throttling).
+# ---------------------------------------------------------------------------
+def render_settings(show_interval):
+    with st.expander("SETTINGS", expanded=False):
+        threshold = st.slider("Detection threshold", 0.10, 0.95, 0.50, 0.05)
+        interval = 5
+        if show_interval:
+            interval = st.slider("Prediction interval (frames)", 1, 15, 5, 1,
+                                 help="Higher = faster (fewer age/gender runs), lower = more responsive labels.")
+    return threshold, interval
+
+
+# ---------------------------------------------------------------------------
+# UPLOAD PHOTO mode — single image, no tracker/smoothing.
+# ---------------------------------------------------------------------------
+def render_upload():
+    threshold, _ = render_settings(show_interval=False)
+    uploaded = st.file_uploader(
+        "Upload a photo", type=["jpg", "jpeg", "png"],
+        label_visibility="collapsed",
+    )
+    if uploaded is None:
+        st.caption("Upload a photo to begin.")
+        return
+
+    # A new file re-runs this cleanly; nothing stale persists.
+    img_rgb = np.array(Image.open(uploaded).convert("RGB"))
+    faces = model.analyze_image(img_rgb, threshold=threshold)
+    tag_primary(faces)                            # accent goes on the largest face
+
+    frame_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    stats = build_stats(faces, fps=None)          # no FPS in a still image
+    annotated = draw_overlay(frame_bgr.copy(), faces, stats)
+    st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+    if not faces:
+        st.caption("NO FACE")
+        return
+
+    ok, buf = cv2.imencode(".png", annotated)
+    if ok:
+        st.download_button(
+            "DOWNLOAD ANNOTATED IMAGE", data=buf.tobytes(),
+            file_name="face_analysis.png", mime="image/png",
+        )
+
+
+# ---------------------------------------------------------------------------
+# LIVE CAMERA mode — streamlit-webrtc video wired to the Phase 2 tracker.
+# ---------------------------------------------------------------------------
+RTC_CONFIG = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
+
+
+class VideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.analyzer = load_model()      # cached -> same instance as `model`
+        self.tracker = FaceTracker()
+        self.threshold = 0.5              # updated from the slider each rerun
+        self.predict_interval = 5
+        self._t_prev = time.time()
+        self._fps = 0.0
+
+    def recv(self, frame):
+        img_bgr = frame.to_ndarray(format="bgr24")
+
+        # threshold passed per-call (never mutates the shared cached analyzer)
+        self.tracker.predict_interval = self.predict_interval
+        dets = self.analyzer.detect_faces(img_bgr, self.threshold)
+        faces = self.tracker.update(dets, img_bgr, self.analyzer)
+
+        now = time.time()
+        dt = now - self._t_prev
+        self._t_prev = now
+        if dt > 0:
+            self._fps = 0.9 * self._fps + 0.1 * (1.0 / dt)   # smoothed FPS
+
+        stats = build_stats(faces, fps=self._fps)
+        draw_overlay(img_bgr, faces, stats)
+        return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
+
+
+def render_live():
+    threshold, interval = render_settings(show_interval=True)
+    st.caption("Real-time. Press START to begin; allow camera access when prompted. Nothing is stored.")
+    ctx = webrtc_streamer(
+        key="live",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIG,
+        video_processor_factory=VideoProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+    # Push the current slider values into the running processor thread.
+    if ctx.video_processor is not None:
+        ctx.video_processor.threshold = threshold
+        ctx.video_processor.predict_interval = interval
+    if not ctx.state.playing:
+        st.caption("Camera stopped. If it will not start, allow camera access for this site in your browser.")
+
+
+# ---------------------------------------------------------------------------
+if st.session_state.mode == "UPLOAD PHOTO":
+    render_upload()
 else:
-    st.markdown("""
-        <div class="result-card">
-            <div class="no-face">Awaiting camera capture...</div>
-        </div>
-    """, unsafe_allow_html=True)
+    render_live()
 
-st.markdown('<div class="footer-text">Built by Akshat Dange · JSPM RSCOE · 2026</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="disclaimer">Pretrained Caffe models. Estimates only, not identity.</div>',
+    unsafe_allow_html=True,
+)
+
+
